@@ -1,0 +1,17 @@
+# Build outputs
+build/
+cmake-build-*/
+
+# Vendored lc0 upstream checkout — not compiled; relevant files are copied
+# into src/chess/ and src/pgn/. See CLAUDE.md.
+lc0/
+
+# Large test corpora — download locally; do not commit.
+tests/data/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+compile_commands.json
