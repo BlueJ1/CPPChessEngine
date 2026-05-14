@@ -83,3 +83,23 @@ Good defaults for the first teacher pass:
 Keep a manifest beside each teacher output with source name, source license,
 engine/network version, Lc0 backend, node/visit budget, temperature settings,
 and command line.
+
+## Lc0 evaluation
+
+Download a network under `data/lc0/`, build Lc0, then evaluate the queue:
+
+```bash
+python3 scripts/evaluate_fens_lc0.py \
+  --lc0 lc0/build/codex-release/lc0 \
+  --weights data/lc0/t1-256x10-distilled-swa-2432500.pb \
+  --input data/tcec_boards_teacher_queue.fen \
+  --out data/evals/lc0_t1_256x10_nodes128.jsonl \
+  --nodes 128 \
+  --threads 1 \
+  --backend blas
+```
+
+The JSONL output stores the FEN, best move, UCI search info, and structured
+`move_stats` parsed from Lc0 verbose move stats. To continue a partially
+completed output, add `--resume`; the script skips the number of records already
+present in the output file.
