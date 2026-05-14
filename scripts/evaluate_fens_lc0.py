@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass
 import json
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +30,27 @@ MOVE_STAT_RE = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class WorkerConfig:
+    name: str
+    backend: str
+    backend_opts: str
+    threads: int
+
+
+@dataclass(frozen=True)
+class Task:
+    ordinal: int
+    input_index: int
+    fen: str
+
+
+@dataclass(frozen=True)
+class WorkerResult:
+    ordinal: int
+    line: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate FENs with Lc0.")
     parser.add_argument("--lc0", type=Path, required=True)
@@ -36,9 +61,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nodes", type=int, default=128)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--backend", default="")
+    parser.add_argument("--backend-opts", default="")
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--cpu-workers", type=int, default=0)
+    parser.add_argument("--cpu-backend", default="blas")
+    parser.add_argument("--cpu-backend-opts", default="")
+    parser.add_argument("--cpu-threads", type=int)
+    parser.add_argument("--gpu-workers", type=int, default=0)
+    parser.add_argument("--gpu-backend", default="metal")
+    parser.add_argument("--gpu-backend-opts", action="append", default=[])
+    parser.add_argument("--gpu-threads", type=int)
+    parser.add_argument("--queue-size", type=int, default=128)
+    parser.add_argument("--minibatch-size", type=int)
+    parser.add_argument("--max-prefetch", type=int)
+    parser.add_argument("--nncache-size", type=int)
+    parser.add_argument("--max-concurrent-searchers", type=int)
     parser.add_argument("--multipv", type=int, default=1)
     parser.add_argument("--score-type", default="WDL_mu")
     parser.add_argument("--no-verbose-move-stats", action="store_true")
+    parser.add_argument("--progress-interval", type=int, default=100)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -102,7 +143,10 @@ def parse_info(line: str) -> dict[str, object]:
 
 
 def maybe_float(value: str) -> float | None:
-    return None if "-" in value else float(value)
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def parse_move_stat(line: str) -> dict[str, object] | None:
@@ -141,12 +185,282 @@ def existing_count(path: Path) -> int:
         return sum(1 for _ in f)
 
 
+def build_worker_configs(args: argparse.Namespace) -> list[WorkerConfig]:
+    configs: list[WorkerConfig] = []
+    if args.cpu_workers or args.gpu_workers:
+        cpu_threads = args.cpu_threads if args.cpu_threads is not None else args.threads
+        gpu_threads = args.gpu_threads if args.gpu_threads is not None else args.threads
+        for i in range(args.cpu_workers):
+            configs.append(
+                WorkerConfig(
+                    name=f"cpu-{i}",
+                    backend=args.cpu_backend,
+                    backend_opts=args.cpu_backend_opts,
+                    threads=cpu_threads,
+                )
+            )
+        for i in range(args.gpu_workers):
+            backend_opts = ""
+            if args.gpu_backend_opts:
+                backend_opts = args.gpu_backend_opts[i % len(args.gpu_backend_opts)]
+            configs.append(
+                WorkerConfig(
+                    name=f"gpu-{i}",
+                    backend=args.gpu_backend,
+                    backend_opts=backend_opts,
+                    threads=gpu_threads,
+                )
+            )
+    else:
+        for i in range(args.workers):
+            configs.append(
+                WorkerConfig(
+                    name=f"worker-{i}",
+                    backend=args.backend,
+                    backend_opts=args.backend_opts,
+                    threads=args.threads,
+                )
+            )
+    return configs
+
+
+def lc0_command(args: argparse.Namespace, config: WorkerConfig) -> list[str]:
+    command = [
+        str(args.lc0),
+        f"--weights={args.weights}",
+        f"--threads={config.threads}",
+    ]
+    if config.backend:
+        command.append(f"--backend={config.backend}")
+    if config.backend_opts:
+        command.append(f"--backend-opts={config.backend_opts}")
+    if args.minibatch_size is not None:
+        command.append(f"--minibatch-size={args.minibatch_size}")
+    if args.max_prefetch is not None:
+        command.append(f"--max-prefetch={args.max_prefetch}")
+    if args.nncache_size is not None:
+        command.append(f"--nncache={args.nncache_size}")
+    if args.max_concurrent_searchers is not None:
+        command.append(f"--max-concurrent-searchers={args.max_concurrent_searchers}")
+    if args.multipv != 1:
+        command.append(f"--multipv={args.multipv}")
+    if args.score_type:
+        command.append(f"--score-type={args.score_type}")
+    if not args.no_verbose_move_stats:
+        command.append("--verbose-move-stats")
+    return command
+
+
+class Lc0Worker:
+    def __init__(self, args: argparse.Namespace, config: WorkerConfig):
+        self.args = args
+        self.config = config
+        self.proc: subprocess.Popen[str] | None = None
+        self.stderr_tail: deque[str] = deque(maxlen=80)
+        self.stderr_thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(
+            lc0_command(self.args, self.config),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self.stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            name=f"{self.config.name}-stderr",
+            daemon=True,
+        )
+        self.stderr_thread.start()
+        send(self.proc, "uci")
+        try:
+            read_until(self.proc, "uciok")
+        except RuntimeError as exc:
+            raise RuntimeError(f"{self.config.name}: {exc}\n{self.stderr()}") from exc
+        send(self.proc, "isready")
+        try:
+            read_until(self.proc, "readyok")
+        except RuntimeError as exc:
+            raise RuntimeError(f"{self.config.name}: {exc}\n{self.stderr()}") from exc
+
+    def _drain_stderr(self) -> None:
+        if self.proc is None or self.proc.stderr is None:
+            return
+        for line in self.proc.stderr:
+            self.stderr_tail.append(line.rstrip("\n"))
+
+    def stderr(self) -> str:
+        if not self.stderr_tail:
+            return "stderr: <empty>"
+        return "stderr tail:\n" + "\n".join(self.stderr_tail)
+
+    def evaluate(self, task: Task) -> dict[str, object]:
+        if self.proc is None:
+            raise RuntimeError("worker was not started")
+        send(self.proc, f"position fen {task.fen}")
+        send(self.proc, f"go nodes {self.args.nodes}")
+
+        info_lines: list[str] = []
+        bestmove = None
+        while True:
+            line = self.proc.stdout.readline()
+            if line == "":
+                raise RuntimeError(
+                    f"{self.config.name}: lc0 exited during search\n{self.stderr()}"
+                )
+            line = line.rstrip("\n")
+            if line.startswith("info "):
+                info_lines.append(line)
+            elif line.startswith("bestmove "):
+                bestmove = line.split()[1]
+                break
+
+        parsed_infos = [parse_info(line) for line in info_lines]
+        move_stats = [stat for line in info_lines if (stat := parse_move_stat(line))]
+        return {
+            "ordinal": task.ordinal,
+            "index": task.input_index,
+            "fen": task.fen,
+            "nodes": self.args.nodes,
+            "bestmove": bestmove,
+            "worker": {
+                "name": self.config.name,
+                "backend": self.config.backend,
+                "threads": self.config.threads,
+            },
+            "info": parsed_infos,
+            "move_stats": move_stats,
+        }
+
+    def close(self) -> None:
+        if self.proc is None:
+            return
+        try:
+            send(self.proc, "quit")
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        if self.stderr_thread is not None:
+            self.stderr_thread.join(timeout=1)
+
+
+def worker_loop(
+    args: argparse.Namespace,
+    config: WorkerConfig,
+    tasks: queue.Queue[Task | None],
+    results: queue.Queue[WorkerResult],
+    errors: queue.Queue[BaseException],
+    stop_event: threading.Event,
+) -> None:
+    worker = Lc0Worker(args, config)
+    try:
+        worker.start()
+        while not stop_event.is_set():
+            try:
+                task = tasks.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                if task is None:
+                    return
+                record = worker.evaluate(task)
+                line = json.dumps(record, separators=(",", ":"))
+                results.put(WorkerResult(task.ordinal, line))
+            finally:
+                tasks.task_done()
+    except BaseException as exc:
+        errors.put(exc)
+        stop_event.set()
+    finally:
+        worker.close()
+
+
+def produce_tasks(
+    args: argparse.Namespace,
+    tasks: queue.Queue[Task | None],
+    worker_count: int,
+    skip: int,
+    stop_event: threading.Event,
+    state: dict[str, int | bool],
+) -> None:
+    produced = 0
+    ordinal = 0
+    try:
+        with args.input.open("r", encoding="utf-8") as fens:
+            for input_index, fen in enumerate(fens):
+                if stop_event.is_set():
+                    break
+                fen = fen.strip()
+                if not fen:
+                    continue
+                if ordinal < skip:
+                    ordinal += 1
+                    continue
+                if args.limit and produced >= args.limit:
+                    break
+                task = Task(ordinal=ordinal, input_index=input_index, fen=fen)
+                while not stop_event.is_set():
+                    try:
+                        tasks.put(task, timeout=0.25)
+                        break
+                    except queue.Full:
+                        continue
+                if stop_event.is_set():
+                    break
+                produced += 1
+                state["produced"] = produced
+                ordinal += 1
+    finally:
+        state["done"] = True
+        if stop_event.is_set():
+            return
+        for _ in range(worker_count):
+            while True:
+                try:
+                    tasks.put(None, timeout=0.25)
+                    break
+                except queue.Full:
+                    continue
+
+
 def main() -> int:
     args = parse_args()
     if args.nodes <= 0:
         raise SystemExit("--nodes must be positive")
-    if args.threads <= 0:
-        raise SystemExit("--threads must be positive")
+    if args.threads < 0:
+        raise SystemExit("--threads must be non-negative")
+    if not (args.cpu_workers or args.gpu_workers) and args.workers <= 0:
+        raise SystemExit("--workers must be positive")
+    if args.cpu_workers < 0 or args.gpu_workers < 0:
+        raise SystemExit("--cpu-workers and --gpu-workers must be non-negative")
+    if args.cpu_threads is not None and args.cpu_threads < 0:
+        raise SystemExit("--cpu-threads must be non-negative")
+    if args.gpu_threads is not None and args.gpu_threads < 0:
+        raise SystemExit("--gpu-threads must be non-negative")
+    if args.queue_size <= 0:
+        raise SystemExit("--queue-size must be positive")
+    if args.minibatch_size is not None and args.minibatch_size < 0:
+        raise SystemExit("--minibatch-size must be non-negative")
+    if args.max_prefetch is not None and args.max_prefetch < 0:
+        raise SystemExit("--max-prefetch must be non-negative")
+    if args.nncache_size is not None and args.nncache_size < 0:
+        raise SystemExit("--nncache-size must be non-negative")
+    if (
+        args.max_concurrent_searchers is not None
+        and args.max_concurrent_searchers < 0
+    ):
+        raise SystemExit("--max-concurrent-searchers must be non-negative")
+    if args.progress_interval < 0:
+        raise SystemExit("--progress-interval must be non-negative")
+
+    worker_configs = build_worker_configs(args)
+    if not worker_configs:
+        raise SystemExit("no workers configured")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = args.manifest or args.out.with_suffix(args.out.suffix + ".manifest.json")
@@ -155,86 +469,68 @@ def main() -> int:
     skip = existing_count(args.out) if args.resume else 0
     mode = "a" if args.resume and args.out.exists() else "w"
 
-    command = [str(args.lc0), f"--weights={args.weights}", f"--threads={args.threads}"]
-    if args.backend:
-        command.append(f"--backend={args.backend}")
-    if args.multipv != 1:
-        command.append(f"--multipv={args.multipv}")
-    if args.score_type:
-        command.append(f"--score-type={args.score_type}")
-    if not args.no_verbose_move_stats:
-        command.append("--verbose-move-stats")
-
-    proc = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+    started = datetime.now(timezone.utc).isoformat()
+    start_time = time.monotonic()
+    evaluated = 0
+    stop_event = threading.Event()
+    task_queue: queue.Queue[Task | None] = queue.Queue(maxsize=args.queue_size)
+    result_queue: queue.Queue[WorkerResult] = queue.Queue()
+    error_queue: queue.Queue[BaseException] = queue.Queue()
+    state: dict[str, int | bool] = {"produced": 0, "done": False}
+    worker_threads = [
+        threading.Thread(
+            target=worker_loop,
+            args=(args, config, task_queue, result_queue, error_queue, stop_event),
+            name=f"lc0-{config.name}",
+            daemon=True,
+        )
+        for config in worker_configs
+    ]
+    producer = threading.Thread(
+        target=produce_tasks,
+        args=(args, task_queue, len(worker_threads), skip, stop_event, state),
+        name="fen-producer",
+        daemon=True,
     )
 
-    started = datetime.now(timezone.utc).isoformat()
-    evaluated = 0
     try:
-        send(proc, "uci")
-        uci_lines = read_until(proc, "uciok")
-        send(proc, "isready")
-        read_until(proc, "readyok")
+        for thread in worker_threads:
+            thread.start()
+        producer.start()
 
-        with args.input.open("r", encoding="utf-8") as fens, args.out.open(
-            mode, encoding="utf-8", newline="\n"
-        ) as out:
-            for index, fen in enumerate(fens):
-                if index < skip:
-                    continue
-                fen = fen.strip()
-                if not fen:
-                    continue
-                send(proc, f"position fen {fen}")
-                send(proc, f"go nodes {args.nodes}")
-
-                info_lines: list[str] = []
-                bestmove = None
-                while True:
-                    line = proc.stdout.readline()
-                    if line == "":
-                        raise RuntimeError("lc0 exited during search")
-                    line = line.rstrip("\n")
-                    if line.startswith("info "):
-                        info_lines.append(line)
-                    elif line.startswith("bestmove "):
-                        bestmove = line.split()[1]
-                        break
-
-                parsed_infos = [parse_info(line) for line in info_lines]
-                move_stats = [
-                    stat for line in info_lines if (stat := parse_move_stat(line))
-                ]
-                record = {
-                    "index": index,
-                    "fen": fen,
-                    "nodes": args.nodes,
-                    "bestmove": bestmove,
-                    "info": parsed_infos,
-                    "move_stats": move_stats,
-                }
-                out.write(json.dumps(record, separators=(",", ":")) + "\n")
-                evaluated += 1
-                if evaluated % 100 == 0:
-                    print(f"[lc0-eval] evaluated {evaluated}", file=sys.stderr)
-                if args.limit and evaluated >= args.limit:
+        pending: dict[int, str] = {}
+        next_ordinal = skip
+        with args.out.open(mode, encoding="utf-8", newline="\n") as out:
+            while True:
+                if not error_queue.empty():
+                    raise error_queue.get()
+                if state["done"] and evaluated >= int(state["produced"]):
                     break
-    finally:
-        try:
-            send(proc, "quit")
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+                try:
+                    result = result_queue.get(timeout=0.25)
+                except queue.Empty:
+                    continue
 
+                pending[result.ordinal] = result.line
+                while next_ordinal in pending:
+                    out.write(pending.pop(next_ordinal) + "\n")
+                    evaluated += 1
+                    next_ordinal += 1
+                    if args.progress_interval and evaluated % args.progress_interval == 0:
+                        elapsed = max(time.monotonic() - start_time, 0.001)
+                        rate = evaluated / elapsed
+                        print(
+                            f"[lc0-eval] evaluated {evaluated} "
+                            f"({rate:.2f} pos/s)",
+                            file=sys.stderr,
+                        )
+    finally:
+        stop_event.set()
+        producer.join(timeout=5)
+        for thread in worker_threads:
+            thread.join(timeout=10)
+
+    total_output_records = existing_count(args.out)
     manifest = {
         "created_at": started,
         "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -243,14 +539,28 @@ def main() -> int:
         "input": str(args.input),
         "output": str(args.out),
         "nodes": args.nodes,
-        "threads": args.threads,
-        "backend": args.backend,
+        "worker_count": len(worker_configs),
+        "workers": [
+            {
+                "name": config.name,
+                "backend": config.backend,
+                "backend_opts": config.backend_opts,
+                "threads": config.threads,
+            }
+            for config in worker_configs
+        ],
         "multipv": args.multipv,
         "score_type": args.score_type,
         "verbose_move_stats": not args.no_verbose_move_stats,
+        "minibatch_size": args.minibatch_size,
+        "max_prefetch": args.max_prefetch,
+        "nncache_size": args.nncache_size,
+        "max_concurrent_searchers": args.max_concurrent_searchers,
         "resume_skipped": skip,
         "evaluated": evaluated,
+        "total_output_records": total_output_records,
         "limit": args.limit,
+        "seconds": round(time.monotonic() - start_time, 3),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"[lc0-eval] wrote {evaluated} records to {args.out}", file=sys.stderr)

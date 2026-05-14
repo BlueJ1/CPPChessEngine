@@ -95,11 +95,53 @@ python3 scripts/evaluate_fens_lc0.py \
   --input data/tcec_boards_teacher_queue.fen \
   --out data/evals/lc0_t1_256x10_nodes128.jsonl \
   --nodes 128 \
-  --threads 1 \
-  --backend blas
+  --backend blas \
+  --workers 4 \
+  --threads 1
 ```
 
 The JSONL output stores the FEN, best move, UCI search info, and structured
 `move_stats` parsed from Lc0 verbose move stats. To continue a partially
 completed output, add `--resume`; the script skips the number of records already
 present in the output file.
+
+For Metal GPU evaluation on Apple Silicon, run several Lc0 subprocesses against
+the same GPU. The coordinator writes JSONL records in input order even when
+workers finish out of order:
+
+```bash
+python3 scripts/evaluate_fens_lc0.py \
+  --lc0 lc0/build/codex-release/lc0 \
+  --weights data/lc0/t1-256x10-distilled-swa-2432500.pb \
+  --input data/tcec_boards_teacher_queue.fen \
+  --out data/evals/lc0_t1_256x10_nodes128.jsonl \
+  --nodes 128 \
+  --gpu-workers 6 \
+  --gpu-backend metal \
+  --gpu-backend-opts gpu=0,batch=8,max_batch=64 \
+  --gpu-threads 1 \
+  --minibatch-size 32 \
+  --max-prefetch 32 \
+  --resume
+```
+
+In the Codex sandbox, Metal device access requires running the evaluator with
+escalated permissions. Without that, Lc0 cannot initialize the Metal device.
+
+On multi-GPU systems, pass one `--gpu-backend-opts` value per device and use
+the GPU backend supported by your Lc0 build. Values are cycled across GPU
+workers:
+
+```bash
+python3 scripts/evaluate_fens_lc0.py \
+  --lc0 lc0/build/codex-release/lc0 \
+  --weights data/lc0/t1-256x10-distilled-swa-2432500.pb \
+  --input data/tcec_boards_teacher_queue.fen \
+  --out data/evals/lc0_t1_256x10_nodes128.jsonl \
+  --nodes 128 \
+  --gpu-workers 2 \
+  --gpu-backend cudnn \
+  --gpu-backend-opts gpu=0 \
+  --gpu-backend-opts gpu=1 \
+  --resume
+```
