@@ -8,6 +8,7 @@ lc0/
 
 # Large test corpora — download locally; do not commit.
 tests/data/
+data/
 
 # Editor / OS
 .DS_Store
